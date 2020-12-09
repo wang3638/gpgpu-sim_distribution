@@ -128,6 +128,8 @@ class mem_fetch {
   mem_fetch *get_original_mf() { return original_mf; }
   mem_fetch *get_original_wr_mf() { return original_wr_mf; }
 
+  bool is_critical() { return m_is_critical; }
+  bool set_critical(bool is_critical) { m_is_critical = is_critical; }
  private:
   // request source information
   unsigned m_request_uid;
@@ -174,6 +176,9 @@ class mem_fetch {
                      // size), so the pointer refers to the original request
   mem_fetch *original_wr_mf;  // this pointer refers to the original write req,
                               // when fetch-on-write policy is used
+
+  // If it is critical or not.
+  bool m_is_critical;
 };
 
 #endif

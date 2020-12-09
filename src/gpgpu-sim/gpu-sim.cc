@@ -512,7 +512,7 @@ void shader_core_config::reg_options(class OptionParser *opp) {
       "1");
   option_parser_register(
       opp, "-gpgpu_scheduler", OPT_CSTR, &gpgpu_scheduler_string,
-      "Scheduler configuration: < lrr | gto | two_level_active > "
+      "Scheduler configuration: < lrr | gto | two_level_active | cawa> "
       "If "
       "two_level_active:<num_active_warps>:<inner_prioritization>:<outer_"
       "prioritization>"
@@ -553,6 +553,7 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
   m_shader_config.reg_options(opp);
   m_memory_config.reg_options(opp);
   power_config::reg_options(opp);
+  m_shader_config.cawa_reg_options(opp);
   option_parser_register(opp, "-gpgpu_max_cycle", OPT_INT64, &gpu_max_cycle_opt,
                          "terminates gpu simulation early (0 = no limit)", "0");
   option_parser_register(opp, "-gpgpu_max_insn", OPT_INT64, &gpu_max_insn_opt,
@@ -696,6 +697,11 @@ void gpgpu_sim::launch(kernel_info_t *kinfo) {
     }
   }
   assert(n < m_running_kernels.size());
+
+  // Initialize the critical_warp_info array
+  m_shader_stats->cpl_launch_kernel(
+      kinfo->get_uid(), kinfo->num_blocks(),
+      kinfo->threads_per_cta() / m_shader_config->warp_size);
 }
 
 bool gpgpu_sim::can_start_kernel() {
@@ -1314,6 +1320,10 @@ void gpgpu_sim::gpu_print_stat() {
                                     "Total_core_cache_fail_stats_breakdown");
   shader_print_scheduler_stat(stdout, false);
 
+  // for (unsigned i = 0; i < m_config.num_cluster(); ++i) {
+  //   m_cluster[i]->print_cacp_stats();
+  // }
+
   m_shader_stats->print(stdout);
 #ifdef GPGPUSIM_POWER_MODEL
   if (m_config.g_power_simulation_enabled) {
@@ -1621,6 +1631,8 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
            m_occupied_cta_to_hwtid.end());
     m_occupied_cta_to_hwtid[free_cta_hw_id] = start_thread;
   }
+
+  cpl_cta_num_in_kernel[free_cta_hw_id] = kernel.cpl_next_cta_num();
 
   // reset the microarchitecture state of the selected hardware thread and warp
   // contexts

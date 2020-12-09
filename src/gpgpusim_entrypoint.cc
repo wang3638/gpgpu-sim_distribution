@@ -267,6 +267,8 @@ void gpgpu_context::print_simulation_time() {
   printf("gpgpu_silicon_slowdown = %ux\n",
          the_gpgpusim->g_the_gpu->shader_clock() * 1000 / cycles_per_sec);
   fflush(stdout);
+
+  the_gpgpusim->g_the_gpu->print_cpl_accuracy();
 }
 
 int gpgpu_context::gpgpu_opencl_ptx_sim_main_perf(kernel_info_t *grid) {

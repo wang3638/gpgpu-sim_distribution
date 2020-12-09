@@ -165,19 +165,41 @@ void shader_core_ctx::create_schedulers() {
   // scedulers
   // must currently occur after all inputs have been initialized.
   std::string sched_config = m_config->gpgpu_scheduler_string;
-  const concrete_scheduler scheduler =
-      sched_config.find("lrr") != std::string::npos
-          ? CONCRETE_SCHEDULER_LRR
-          : sched_config.find("two_level_active") != std::string::npos
-                ? CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE
-                : sched_config.find("gto") != std::string::npos
-                      ? CONCRETE_SCHEDULER_GTO
-                      : sched_config.find("old") != std::string::npos
-                            ? CONCRETE_SCHEDULER_OLDEST_FIRST
-                            : sched_config.find("warp_limiting") !=
-                                      std::string::npos
-                                  ? CONCRETE_SCHEDULER_WARP_LIMITING
-                                  : NUM_CONCRETE_SCHEDULERS;
+  // const concrete_scheduler scheduler =
+  //     sched_config.find("lrr") != std::string::npos
+  //         ? CONCRETE_SCHEDULER_LRR
+  //         : sched_config.find("two_level_active") != std::string::npos
+  //               ? CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE
+  //               : sched_config.find("gto") != std::string::npos
+  //                     ? CONCRETE_SCHEDULER_GTO
+  //                     : sched_config.find("old") != std::string::npos
+  //                           ? CONCRETE_SCHEDULER_OLDEST_FIRST
+  //                           : sched_config.find("warp_limiting") !=
+  //                                     std::string::npos
+  //                                 ? CONCRETE_SCHEDULER_WARP_LIMITING
+  //                                 : NUM_CONCRETE_SCHEDULERS;
+  concrete_scheduler scheduler = NUM_CONCRETE_SCHEDULERS;
+  if (sched_config.find("gcaws") != std::string::npos) {
+    scheduler = CONCRETE_SCHEDULER_GCAWS;
+  }
+  if (sched_config.find("caws") != std::string::npos) {
+    scheduler = CONCRETE_SCHEDULER_CAWS;
+  }
+  if (sched_config.find("ward_limiting") != std::string::npos) {
+    scheduler = CONCRETE_SCHEDULER_WARP_LIMITING;
+  }
+  if (sched_config.find("old") != std::string::npos) {
+    scheduler = CONCRETE_SCHEDULER_OLDEST_FIRST;
+  }
+  if (sched_config.find("gto") != std::string::npos) {
+    scheduler = CONCRETE_SCHEDULER_GTO;
+  }
+  if (sched_config.find("two_level_active") != std::string::npos) {
+    scheduler = CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE;
+  }
+  if (sched_config.find("lrr") != std::string::npos) {
+    scheduler = CONCRETE_SCHEDULER_LRR;
+  }
   assert(scheduler != NUM_CONCRETE_SCHEDULERS);
 
   for (unsigned i = 0; i < m_config->gpgpu_num_sched_per_core; i++) {
@@ -221,6 +243,22 @@ void shader_core_ctx::create_schedulers() {
             &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
             &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
             &m_pipeline_reg[ID_OC_MEM], i, m_config->gpgpu_scheduler_string));
+        break;
+      case CONCRETE_SCHEDULER_CAWS:
+        schedulers.push_back(new caws_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i));
+        break;
+      case CONCRETE_SCHEDULER_GCAWS:
+        schedulers.push_back(new gcaws_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i));
         break;
       default:
         abort();
@@ -491,6 +529,7 @@ void shader_core_ctx::reinit(unsigned start_thread, unsigned end_thread,
        i < end_thread / m_config->warp_size; ++i) {
     m_warp[i]->reset();
     m_simt_stack[i]->reset();
+    m_stats->cpl_warp_cta_cycle_dist[m_sid][i] = 0;
   }
 }
 
@@ -536,6 +575,9 @@ void shader_core_ctx::init_warps(unsigned cta_id, unsigned start_thread,
         start_pc = pc;
       }
 
+	  m_warp[i]->cpl_warp_enter(
+          m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle,
+          /*ninst=*/ 0);
       m_warp[i]->init(start_pc, cta_id, i, active_threads, m_dynamic_warp_id);
       ++m_dynamic_warp_id;
       m_not_completed += n_active;
@@ -914,6 +956,8 @@ void shader_core_ctx::fetch() {
             unsigned tid = warp_id * m_config->warp_size + t;
             if (m_threadState[tid].m_active == true) {
               m_threadState[tid].m_active = false;
+			  m_warp[warp_id]->cpl_warp_exit(m_gpu->gpu_tot_sim_cycle +
+                                                 m_gpu->gpu_sim_cycle);
               unsigned cta_id = m_warp[warp_id]->get_cta_id();
               if (m_thread[tid] == NULL) {
                 register_cta_thread_exit(cta_id, m_kernel);
@@ -1009,6 +1053,9 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
   m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
   func_exec_inst(**pipe_reg);
 
+  assert(warp_id < m_config->max_warps_per_shader);
+  m_stats->cpl_warp_cta_cycle_dist[m_sid][warp_id]++;
+
   if (next_inst->op == BARRIER_OP) {
     m_warp[warp_id]->store_info_of_last_inst_at_barrier(*pipe_reg);
     m_barriers.warp_reaches_barrier(m_warp[warp_id]->get_cta_id(), warp_id,
@@ -1018,6 +1065,10 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
     m_warp[warp_id]->set_membar();
   }
 
+  address_type npc = calc_npc_per_warp(warp_id);
+  m_warp[warp_id]->cpl_warp_issue(
+      m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle, npc, next_inst->isize);
+
   updateSIMTStack(warp_id, *pipe_reg);
 
   m_scoreboard->reserveRegisters(*pipe_reg);
@@ -1025,6 +1076,8 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
 }
 
 void shader_core_ctx::issue() {
+  calc_shader_cpl(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
+
   // Ensure fair round robin issu between schedulers
   unsigned j;
   for (unsigned i = 0; i < schedulers.size(); i++) {
@@ -1713,8 +1766,9 @@ void ldst_unit::get_L1T_sub_stats(struct cache_sub_stats &css) const {
 
 void shader_core_ctx::warp_inst_complete(const warp_inst_t &inst) {
 #if 0
-      printf("[warp_inst_complete] uid=%u core=%u warp=%u pc=%#x @ time=%llu \n",
-             inst.get_uid(), m_sid, inst.warp_id(), inst.pc,  m_gpu->gpu_tot_sim_cycle +  m_gpu->gpu_sim_cycle);
+  printf("[warp_inst_complete] uid=%u core=%u warp=%u pc=%#x @ time=%llu \n",
+         inst.get_uid(), m_sid, inst.warp_id(), inst.pc,
+         m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
 #endif
 
   if (inst.op_pipe == SP__OP)
@@ -1770,6 +1824,9 @@ void shader_core_ctx::writeback() {
     unsigned warp_id = pipe_reg->warp_id();
     m_scoreboard->releaseRegisters(pipe_reg);
     m_warp[warp_id]->dec_inst_in_pipeline();
+
+	m_warp[warp_id]->cpl_warp_complete();
+
     warp_inst_complete(*pipe_reg);
     m_gpu->gpu_sim_insn_last_update_sid = m_sid;
     m_gpu->gpu_sim_insn_last_update = m_gpu->gpu_sim_cycle;
@@ -1849,6 +1906,9 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue(cache_t *cache,
   mem_fetch *mf = m_mf_allocator->alloc(
       inst, inst.accessq_back(),
       m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle);
+
+  mf->set_critical(m_core->get_warp_criticality(mf->get_wid()));
+
   std::list<cache_event> events;
   enum cache_request_status status = cache->access(
       mf->get_addr(), mf,
@@ -2368,9 +2428,23 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
   if (!m_config->m_L1D_config.disabled()) {
     char L1D_name[STRSIZE];
     snprintf(L1D_name, STRSIZE, "L1D_%03d", m_sid);
-    m_L1D = new l1_cache(L1D_name, m_config->m_L1D_config, m_sid,
-                         get_shader_normal_cache_id(), m_icnt, m_mf_allocator,
-                         IN_L1D_MISS_QUEUE, core->get_gpu());
+
+    if (m_config->enable_cacp_l1_cache) {
+      cacp_tag_array* new_tag_array = new cacp_tag_array(
+          m_config->m_L1D_config, m_sid, get_shader_normal_cache_id());
+      m_L1D = (l1_cache *)new cacp_l1_cache(L1D_name,
+                                            m_config->m_L1D_config,
+                                            m_sid,
+                                            get_shader_normal_cache_id(),
+                                            m_icnt,
+                                            m_mf_allocator,
+                                            IN_L1D_MISS_QUEUE,
+                                            core->get_gpu());
+    } else {
+      m_L1D = new l1_cache(L1D_name, m_config->m_L1D_config, m_sid,
+                           get_shader_normal_cache_id(), m_icnt, m_mf_allocator,
+                           IN_L1D_MISS_QUEUE, core->get_gpu());
+    }
 
     l1_latency_queue.resize(m_config->m_L1D_config.l1_banks);
     assert(m_config->m_L1D_config.l1_latency > 0);

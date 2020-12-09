@@ -232,7 +232,7 @@ void tag_array::remove_pending_line(mem_fetch *mf) {
 
 enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
                                            mem_fetch *mf,
-                                           bool probe_mode) const {
+                                           bool probe_mode) {
   mem_access_sector_mask_t mask = mf->get_access_sector_mask();
   return probe(addr, idx, mask, probe_mode, mf);
 }
@@ -240,7 +240,7 @@ enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
 enum cache_request_status tag_array::probe(new_addr_type addr, unsigned &idx,
                                            mem_access_sector_mask_t mask,
                                            bool probe_mode,
-                                           mem_fetch *mf) const {
+                                           mem_fetch *mf) {
   // assert( m_config.m_write_policy == READ_ONLY );
   unsigned set_index = m_config.set_index(addr);
   new_addr_type tag = m_config.tag(addr);

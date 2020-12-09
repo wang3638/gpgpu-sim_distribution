@@ -121,7 +121,17 @@ class shd_warp_t {
     // Jin: cdp support
     m_cdp_latency = 0;
     m_cdp_dummy = false;
+
+    cpl_actual = 0;
+    cpl_nInst = 0;
+    cpl_nStall = 0;
+    cpl_warp_entered_cycle = 0;
+    cpl_warp_completed_cycle = 0;
+    cpl_num_completed_inst = 0;
+    cpl_last_schedule_cycle = 0;
+    cpl_is_critical = true;
   }
+
   void init(address_type start_pc, unsigned cta_id, unsigned wid,
             const std::bitset<MAX_WARP_SIZE> &active,
             unsigned dynamic_warp_id) {
@@ -138,6 +148,14 @@ class shd_warp_t {
     // Jin: cdp support
     m_cdp_latency = 0;
     m_cdp_dummy = false;
+
+    cpl_nInst = 0;
+    cpl_nStall = 0;
+    cpl_warp_entered_cycle = 0;
+    cpl_warp_completed_cycle = 0;
+    cpl_num_completed_inst = 0;
+    cpl_last_schedule_cycle = 0;
+    cpl_is_critical = true;
   }
 
   bool functional_done() const;
@@ -239,6 +257,19 @@ class shd_warp_t {
   unsigned get_warp_id() const { return m_warp_id; }
 
   class shader_core_ctx * get_shader() { return m_shader; }
+
+  void cpl_warp_enter(unsigned cycle, unsigned ninst);
+  void cpl_warp_issue(unsigned cycle, address_type npc, unsigned isize);
+  void cpl_warp_complete();
+  void cpl_warp_exit(unsigned cycle);
+  void calc_warp_cpl(unsigned cycle);
+  float get_cpl() const;
+  unsigned cpl_get_warp_execution_cycles() const {
+    assert(cpl_warp_entered_cycle < cpl_warp_completed_cycle);
+    return cpl_warp_completed_cycle - cpl_warp_entered_cycle;
+  }
+  bool cpl_is_critical;
+
  private:
   static const unsigned IBUFFER_SIZE = 2;
   class shader_core_ctx *m_shader;
@@ -282,6 +313,14 @@ class shd_warp_t {
  public:
   unsigned int m_cdp_latency;
   bool m_cdp_dummy;
+
+  unsigned cpl_nInst;
+  unsigned cpl_nStall;
+  unsigned cpl_warp_entered_cycle;
+  unsigned cpl_warp_completed_cycle;
+  unsigned cpl_num_completed_inst;
+  unsigned cpl_last_schedule_cycle;
+  float cpl_actual;
 };
 
 inline unsigned hw_tid_from_wid(unsigned wid, unsigned warp_size, unsigned i) {
@@ -310,6 +349,9 @@ enum scheduler_prioritization_type {
   SCHEDULER_PRIORITIZATION_GTY,       // Greedy Then Youngest
   SCHEDULER_PRIORITIZATION_OLDEST,    // Oldest First
   SCHEDULER_PRIORITIZATION_YOUNGEST,  // Youngest First
+
+  SCHEDULER_PRIORITIZATION_CAWS,
+  SCHEDULER_PRIORITIZATION_GCAWS,
 };
 
 // Each of these corresponds to a string value in the gpgpsim.config file
@@ -320,6 +362,10 @@ enum concrete_scheduler {
   CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE,
   CONCRETE_SCHEDULER_WARP_LIMITING,
   CONCRETE_SCHEDULER_OLDEST_FIRST,
+
+  CONCRETE_SCHEDULER_CAWS,
+  CONCRETE_SCHEDULER_GCAWS,
+
   NUM_CONCRETE_SCHEDULERS
 };
 
@@ -557,6 +603,58 @@ class swl_scheduler : public scheduler_unit {
  protected:
   scheduler_prioritization_type m_prioritization;
   unsigned m_num_warps_to_limit;
+};
+
+class caws_scheduler : public scheduler_unit {
+public:
+  caws_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                 Scoreboard *scoreboard, simt_stack **simt,
+                 std::vector<shd_warp_t *> *warp, register_set *sp_out,
+                 register_set *dp_out, register_set *sfu_out,
+                 register_set *int_out, register_set *tensor_core_out,
+                 std::vector<register_set *> &spec_cores_out,
+                 register_set *mem_out, int id);
+	virtual ~caws_scheduler() {}
+	virtual void order_warps();
+    virtual void done_adding_supervised_warps() {
+      m_last_supervised_issued = m_supervised_warps.begin();
+    }
+    void order_by_priority(
+        std::vector<shd_warp_t*>& result_list,
+		const std::vector<shd_warp_t*>& input_list,
+		const std::vector<shd_warp_t*>::const_iterator& last_issued_from_input,
+		unsigned num_warps_to_add);
+    void sort_warps(std::vector<shd_warp_t*>& temp);
+
+private:
+  int m_count;
+  int m_flag;
+};
+
+class gcaws_scheduler : public scheduler_unit {
+public:
+  gcaws_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                  Scoreboard *scoreboard, simt_stack **simt,
+                  std::vector<shd_warp_t *> *warp, register_set *sp_out,
+                  register_set *dp_out, register_set *sfu_out,
+                  register_set *int_out, register_set *tensor_core_out,
+                  std::vector<register_set *> &spec_cores_out,
+                  register_set *mem_out, int id);
+  virtual ~gcaws_scheduler() {}
+  virtual void order_warps();
+  virtual void done_adding_supervised_warps() {
+    m_last_supervised_issued = m_supervised_warps.begin();
+  }
+  void order_by_priority(
+      std::vector<shd_warp_t*>& result_list,
+  	  const std::vector<shd_warp_t*>& input_list,
+  	  const std::vector<shd_warp_t*>::const_iterator& last_issued_from_input,
+  	  unsigned num_warps_to_add);
+  void sort_warps(std::vector<shd_warp_t*>& temp);
+
+private:
+  int m_count;
+  int m_flag;
 };
 
 class opndcoll_rfu_t {  // operand collector based register file unit
@@ -1302,6 +1400,8 @@ class ldst_unit : public pipelined_simd_unit {
   void get_L1C_sub_stats(struct cache_sub_stats &css) const;
   void get_L1T_sub_stats(struct cache_sub_stats &css) const;
 
+  void print_cacp_stats() const;
+
  protected:
   ldst_unit(mem_fetch_interface *icnt,
             shader_core_mem_fetch_allocator *mf_allocator,
@@ -1481,6 +1581,7 @@ class shader_core_config : public core_config {
     }
   }
   void reg_options(class OptionParser *opp);
+  void cawa_reg_options(class OptionParser *opp);
   unsigned max_cta(const kernel_info_t &k) const;
   unsigned num_shader() const {
     return n_simt_clusters * n_simt_cores_per_cluster;
@@ -1526,6 +1627,9 @@ class shader_core_config : public core_config {
   unsigned gpgpu_num_sched_per_core;
   int gpgpu_max_insn_issue_per_warp;
   bool gpgpu_dual_issue_diff_exec_units;
+
+  // on = use cacp; off = no cacp
+  bool enable_cacp_l1_cache;
 
   // op collector
   bool enable_specialized_operand_collector;
@@ -1795,6 +1899,16 @@ class shader_core_stats : public shader_core_stats_pod {
 
     m_shader_dynamic_warp_issue_distro.resize(config->num_shader());
     m_shader_warp_slot_issue_distro.resize(config->num_shader());
+
+	cpl_warp_cta_cycle_dist =
+        (int **)calloc(config->num_shader(), sizeof(int *));
+	for (unsigned i = 0; i < config->num_shader(); ++i) {
+	  cpl_warp_cta_cycle_dist[i] =
+          (int *)calloc(config->max_warps_per_shader, sizeof(int));
+	}
+	cpl_num_launched_kernels = 0;
+	cpl_accurate_cpl_for_accuracy = 0;
+	cpl_total_cpl_for_accuracy = 0;
   }
 
   ~shader_core_stats() {
@@ -1824,6 +1938,10 @@ class shader_core_stats : public shader_core_stats_pod {
     return m_shader_warp_slot_issue_distro;
   }
 
+  void cpl_launch_kernel(unsigned kid, unsigned total_cta,
+                           unsigned num_warps_per_cta);
+  void print_cpl_accuracy(FILE* fp) const;
+
  private:
   const shader_core_config *m_config;
 
@@ -1835,6 +1953,12 @@ class shader_core_stats : public shader_core_stats_pod {
   std::vector<unsigned> m_last_shader_dynamic_warp_issue_distro;
   std::vector<std::vector<unsigned>> m_shader_warp_slot_issue_distro;
   std::vector<unsigned> m_last_shader_warp_slot_issue_distro;
+
+  std::vector<int **> cpl_actual_vec;
+  int **cpl_warp_cta_cycle_dist;
+  unsigned cpl_num_launched_kernels;
+  unsigned cpl_total_cpl_for_accuracy;
+  unsigned cpl_accurate_cpl_for_accuracy;
 
   friend class power_stat_t;
   friend class shader_core_ctx;
@@ -1879,6 +2003,9 @@ class shader_core_ctx : public core_t {
                   unsigned shader_id, unsigned tpc_id,
                   const shader_core_config *config,
                   const memory_config *mem_config, shader_core_stats *stats);
+
+  void calc_warp_criticality();
+  bool get_warp_criticality(unsigned warp_id);
 
   // used by simt_core_cluster:
   // modifiers
@@ -1951,6 +2078,8 @@ class shader_core_ctx : public core_t {
   void get_L1T_sub_stats(struct cache_sub_stats &css) const;
 
   void get_icnt_power_stats(long &n_simt_to_mem, long &n_mem_to_simt) const;
+
+  void print_cacp_stats() const;
 
   // debug:
   void display_simt_state(FILE *fout, int mask) const;
@@ -2129,12 +2258,21 @@ class shader_core_ctx : public core_t {
   void decode();
 
   void issue();
+
   friend class scheduler_unit;  // this is needed to use private issue warp.
   friend class TwoLevelScheduler;
   friend class LooseRoundRobbinScheduler;
   virtual void issue_warp(register_set &warp, const warp_inst_t *pI,
-                  const active_mask_t &active_mask, unsigned warp_id,
-                  unsigned sch_id);
+                          const active_mask_t &active_mask, unsigned warp_id,
+                          unsigned sch_id);
+
+  unsigned cpl_cta_num_in_kernel[MAX_CTA_PER_SHADER];
+  void cpl_get_start_end_warp_id(unsigned* start_warp_id, unsigned* end_warp_id, unsigned cta_num) const;
+  void print_cpl_counters(unsigned start_id, unsigned end_id) const;
+  void calc_shader_cpl(unsigned cycle);
+  void calc_shader_cpl_accuracy() const;
+  address_type calc_npc_per_warp(unsigned warp_id);
+  std::vector<float> get_current_cpl_counters() const;
 
   void create_front_pipeline();
   void create_schedulers();
@@ -2346,6 +2484,7 @@ class simt_core_cluster {
                               unsigned long long &total) const;
   virtual void create_shader_core_ctx() = 0;
 
+  void print_cacp_stats() const;
  protected:
   unsigned m_cluster_id;
   gpgpu_sim *m_gpu;

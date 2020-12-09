@@ -103,6 +103,9 @@ struct cache_block_t {
   cache_block_t() {
     m_tag = 0;
     m_block_addr = 0;
+    m_c_reuse = false;
+    m_nc_reuse = false;
+    m_signature = 0;
   }
 
   virtual void allocate(new_addr_type tag, new_addr_type block_addr,
@@ -137,6 +140,10 @@ struct cache_block_t {
 
   new_addr_type m_tag;
   new_addr_type m_block_addr;
+
+  bool m_c_reuse;
+  bool m_nc_reuse;
+  unsigned m_signature;
 };
 
 struct line_cache_block : public cache_block_t {
@@ -775,6 +782,7 @@ class cache_config {
       m_set_index_function;  // Hash, linear, or custom set index function
 
   friend class tag_array;
+  friend class cacp_tag_array;
   friend class baseline_cache;
   friend class read_only_cache;
   friend class tex_cache;
@@ -818,16 +826,17 @@ class tag_array {
   ~tag_array();
 
   enum cache_request_status probe(new_addr_type addr, unsigned &idx,
-                                  mem_fetch *mf, bool probe_mode = false) const;
-  enum cache_request_status probe(new_addr_type addr, unsigned &idx,
-                                  mem_access_sector_mask_t mask,
-                                  bool probe_mode = false,
-                                  mem_fetch *mf = NULL) const;
+                                  mem_fetch *mf, bool probe_mode = false);
+  virtual enum cache_request_status probe(new_addr_type addr, unsigned &idx,
+                                          mem_access_sector_mask_t mask,
+                                          bool probe_mode = false,
+                                          mem_fetch *mf = NULL);
   enum cache_request_status access(new_addr_type addr, unsigned time,
                                    unsigned &idx, mem_fetch *mf);
-  enum cache_request_status access(new_addr_type addr, unsigned time,
-                                   unsigned &idx, bool &wb,
-                                   evicted_block_info &evicted, mem_fetch *mf);
+  virtual enum cache_request_status access(new_addr_type addr, unsigned time,
+                                           unsigned &idx, bool &wb,
+                                           evicted_block_info &evicted,
+                                           mem_fetch *mf);
 
   void fill(new_addr_type addr, unsigned time, mem_fetch *mf);
   void fill(unsigned idx, unsigned time, mem_fetch *mf);
@@ -883,6 +892,35 @@ class tag_array {
 
   typedef tr1_hash_map<new_addr_type, unsigned> line_table;
   line_table pending_lines;
+};
+
+class cacp_tag_array : public tag_array {
+ public:
+  cacp_tag_array(cache_config &config, int core_id, int type_id )
+      : tag_array(config, core_id, type_id), is_correct(false) {
+    for (unsigned i = 0; i < 256; ++i) {
+      SHiP[i] = 3;
+      CCBP[i] = 1;
+    }
+    is_correct = false;
+  }
+
+  virtual enum cache_request_status probe(new_addr_type addr, unsigned &idx,
+                                          mem_access_sector_mask_t mask,
+                                          bool probe_mode = false,
+                                          mem_fetch *mf = NULL);
+  virtual enum cache_request_status access(new_addr_type addr, unsigned time,
+                                           unsigned &idx, bool &wb,
+                                           evicted_block_info &evicted,
+                                           mem_fetch *mf);
+  void cache_hit(bool critical, unsigned idx);
+  void evict_line(unsigned idx, unsigned set_index);
+
+  // Use unsigned element to represent 2-bit saturating counters, the range of
+  // each element is [0, 3].
+  unsigned CCBP[256];
+  unsigned SHiP[256];
+  bool is_correct;
 };
 
 class mshr_table {
@@ -1414,6 +1452,8 @@ class data_cache : public baseline_cache {
                                            unsigned time,
                                            std::list<cache_event> &events);
 
+  virtual void print_cacp_stats() const {  };
+
  protected:
   data_cache(const char *name, cache_config &config, int core_id, int type_id,
              mem_fetch_interface *memport, mem_fetch_allocator *mfcreator,
@@ -1555,6 +1595,62 @@ class l1_cache : public data_cache {
            class gpgpu_sim *gpu)
       : data_cache(name, config, core_id, type_id, memport, mfcreator, status,
                    new_tag_array, L1_WR_ALLOC_R, L1_WRBK_ACC, gpu) {}
+};
+
+class cacp_cache_stats {
+ public:
+  cacp_cache_stats() : m_total_critical_access(0),
+                       m_total_critical_hit(0),
+                       m_total_hit(0),
+                       m_total_access(0),
+                       m_ccbp_correct(0) {};
+  ~cacp_cache_stats() {}
+
+  void record_stats(enum cache_request_status status,
+                    bool is_critical, bool correct);
+  void print_stats() const;
+
+ private:
+  unsigned m_total_critical_access;
+  unsigned m_total_critical_hit;
+  unsigned m_total_hit;
+  unsigned m_total_access;
+  unsigned m_ccbp_correct;
+};
+
+class cacp_l1_cache : public data_cache {
+ public:
+  cacp_l1_cache(const char *name, cache_config &config, int core_id,
+                int type_id, mem_fetch_interface *memport,
+                mem_fetch_allocator *mfcreator, enum mem_fetch_status status,
+                class gpgpu_sim *gpu)
+  : data_cache(name, config, core_id, type_id, memport, mfcreator,status,
+               L1_WR_ALLOC_R, L1_WRBK_ACC, gpu) {
+    m_cacp_stats = new cacp_cache_stats();
+  }
+
+  cacp_l1_cache(const char *name, cache_config &config, int core_id,
+                int type_id, mem_fetch_interface *memport,
+                mem_fetch_allocator *mfcreator, enum mem_fetch_status status,
+                class gpgpu_sim *gpu, cacp_tag_array* new_tag_array)
+  : data_cache(name, config, core_id, type_id, memport, mfcreator,status,
+               new_tag_array, L1_WR_ALLOC_R, L1_WRBK_ACC, gpu) {
+    m_cacp_stats = new cacp_cache_stats();
+  }
+
+  virtual ~cacp_l1_cache() {
+    if (m_cacp_stats != NULL) {
+      delete m_cacp_stats;
+    }
+  }
+
+  virtual enum cache_request_status access(
+      new_addr_type addr, mem_fetch *mf, unsigned time,
+      std::list<cache_event> &events);
+  virtual void print_cacp_stats() const;
+
+ private:
+  cacp_cache_stats *m_cacp_stats;
 };
 
 /// Models second level shared cache with global write-back

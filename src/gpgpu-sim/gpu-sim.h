@@ -559,6 +559,8 @@ class gpgpu_sim : public gpgpu_t {
    */
   simt_core_cluster *getSIMTCluster();
 
+  void print_cpl_accuracy() const;
+
   void hit_watchpoint(unsigned watchpoint_num, ptx_thread_info *thd,
                       const ptx_instruction *pI);
 

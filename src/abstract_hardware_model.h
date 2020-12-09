@@ -268,6 +268,11 @@ class kernel_info_t {
     return m_param_mem;
   }
 
+  unsigned cpl_next_cta_num() const {
+    return m_next_cta.x + m_next_cta.y * m_grid_dim.x +
+           m_next_cta.z * m_grid_dim.x * m_grid_dim.y;
+  }
+
   // The following functions access texture bindings present at the kernel's
   // launch
 
